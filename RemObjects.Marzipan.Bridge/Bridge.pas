@@ -57,6 +57,8 @@ type
     class var fAssemblySearchPaths: HashSet<String> := new HashSet<String>(StringComparer.OrdinalIgnoreCase);
     class var fTypes: Dictionary<String, System.Type> := new Dictionary<String, System.Type>(StringComparer.Ordinal);
     class var fMethods: Dictionary<String, MethodBridge> := new Dictionary<String, MethodBridge>(StringComparer.Ordinal);
+    [ThreadStatic]
+    class var fResolvingMethods: HashSet<String>;
 
     class constructor;
     class method CacheLoadedAssembly(aFullPath: String; aAssembly: System.Reflection.&Assembly): System.Reflection.&Assembly;
@@ -65,6 +67,7 @@ type
     class method ResolveAssemblyFromRegisteredPaths(aContext: AssemblyLoadContext; aName: AssemblyName): System.Reflection.&Assembly;
     class method ResolveTrustedPlatformAssembly(aName: AssemblyName): String;
     class method SimpleAssemblyName(aAssemblyName: String): String;
+    class method TryGetParameters(aMethod: MethodBase; out aParameters: array of ParameterInfo): Boolean;
   public
     class method LoadAssembly(aPath: String): System.Reflection.&Assembly;
     class method ResolveType(aAssemblyName: String; aTypeName: String): System.Type;
@@ -80,7 +83,7 @@ type
     property Parameters: List<String>;
 
     class method Parse(aSignature: String): MethodSignature;
-    class method Matches(aMethod: MethodBase; aSignature: MethodSignature): Boolean;
+    class method Matches(aParameters: array of ParameterInfo; aSignature: MethodSignature): Boolean;
   end;
 
   ObjectHelpers = public static class
@@ -130,6 +133,7 @@ type
     // Tiny managed methods for native smoke tests. They go through the same
     // reflection/call-frame machinery as real imported APIs, but keep Fire and
     // compiler state out of exception-propagation tests.
+    class method CountStrings(aValues: sequence of String): Integer;
     class method ThrowArgumentException;
     class method ThrowNullReferenceException;
   end;
@@ -646,7 +650,14 @@ begin
     var lExisting: MethodBridge;
     if fMethods.TryGetValue(lKey, out lExisting) then
       exit lExisting;
+  end;
 
+  if fResolvingMethods = nil then
+    fResolvingMethods := new HashSet<String>(StringComparer.Ordinal);
+  if not fResolvingMethods.Add(lKey) then
+    raise new InvalidOperationException($"Re-entrant Marzipan method resolution for '{aSignature}' on '{aTypeName}, {aAssemblyName}'.");
+
+  try
     var lType := ResolveType(aAssemblyName, aTypeName);
     var lParsed := MethodSignature.Parse(aSignature);
     var lFlags := BindingFlags.Public or BindingFlags.NonPublic or BindingFlags.Static or BindingFlags.Instance;
@@ -663,26 +674,56 @@ begin
     end;
 
     var lMethod: MethodBase := nil;
-    for each lCandidate in lCandidates do
-      if MethodSignature.Matches(lCandidate, lParsed) then begin
+    var lMethodParameters: array of ParameterInfo := nil;
+    for each lCandidate in lCandidates do begin
+      var lParameters: array of ParameterInfo;
+      if TryGetParameters(lCandidate, out lParameters) and MethodSignature.Matches(lParameters, lParsed) then begin
         lMethod := lCandidate;
+        lMethodParameters := lParameters;
         break;
       end;
+    end;
 
     if lMethod = nil then begin
-      for each lCandidate in lCandidates do
-        if lCandidate.GetParameters().Length = lParsed.Parameters.Count then begin
+      for each lCandidate in lCandidates do begin
+        var lParameters: array of ParameterInfo;
+        if TryGetParameters(lCandidate, out lParameters) and (lParameters.Length = lParsed.Parameters.Count) then begin
           lMethod := lCandidate;
+          lMethodParameters := lParameters;
           break;
         end;
+      end;
     end;
 
     if lMethod = nil then
       raise new MissingMethodException(lType.FullName, aSignature);
 
-    var lBridge := new MethodBridge(&Type := lType, ReflectedMethod := lMethod, Parameters := lMethod.GetParameters());
-    fMethods[lKey] := lBridge;
-    result := lBridge;
+    var lBridge := new MethodBridge(&Type := lType, ReflectedMethod := lMethod, Parameters := lMethodParameters);
+    locking fMethods do begin
+      var lExisting: MethodBridge;
+      if fMethods.TryGetValue(lKey, out lExisting) then
+        exit lExisting;
+      fMethods[lKey] := lBridge;
+    end;
+    exit lBridge;
+  finally
+    fResolvingMethods.Remove(lKey);
+  end;
+end;
+
+class method RuntimeState.TryGetParameters(aMethod: MethodBase; out aParameters: array of ParameterInfo): Boolean;
+begin
+  aParameters := nil;
+  try
+    aParameters := aMethod.GetParameters();
+    exit assigned(aParameters);
+  except
+    // Some compiler methods carry signatures that the active CoreCLR cannot
+    // materialize. They are simply not candidates for this lookup. In
+    // particular, do not log here: method lookup can run while a debugger
+    // callback is crossing managed/native boundaries, and Console.Error would
+    // synchronously re-enter that callback path.
+    exit false;
   end;
 end;
 
@@ -705,14 +746,15 @@ begin
   result := new MethodSignature(Name := lName, Parameters := SplitArgs(lArgsText));
 end;
 
-class method MethodSignature.Matches(aMethod: MethodBase; aSignature: MethodSignature): Boolean;
+class method MethodSignature.Matches(aParameters: array of ParameterInfo; aSignature: MethodSignature): Boolean;
 begin
-  var lParameters := aMethod.GetParameters();
-  if lParameters.Length <> aSignature.Parameters.Count then
+  if not assigned(aParameters) then
+    exit false;
+  if aParameters.Length <> aSignature.Parameters.Count then
     exit false;
 
-  for i: Integer := 0 to lParameters.Length - 1 do begin
-    var lActual := ToMonoSignature(lParameters[i].ParameterType);
+  for i: Integer := 0 to aParameters.Length - 1 do begin
+    var lActual := ToMonoSignature(aParameters[i].ParameterType);
     if not String.Equals(lActual, aSignature.Parameters[i], StringComparison.Ordinal) then
       exit false;
   end;
@@ -898,6 +940,11 @@ begin
     on e: Exception do
       result := Handles.Alloc(e);
   end;
+end;
+
+class method TestHelpers.CountStrings(aValues: sequence of String): Integer;
+begin
+  result := coalesce(aValues:Count(), 0);
 end;
 
 class method TestHelpers.ThrowArgumentException;
@@ -1642,6 +1689,17 @@ begin
     for i: Integer := 0 to lSource.Length - 1 do
       lResult.SetValue(ConvertArgument(lSource.GetValue(i), lElementType), i);
     exit lResult;
+  end;
+  if lTargetType.IsInterface and lTargetType.IsGenericType and (aValue is System.Array) then begin
+    var lGenericArguments := lTargetType.GetGenericArguments();
+    if lGenericArguments.Length = 1 then begin
+      var lSource := System.Array(aValue);
+      var lResult := System.Array.CreateInstance(lGenericArguments[0], lSource.Length);
+      for i: Integer := 0 to lSource.Length - 1 do
+        lResult.SetValue(ConvertArgument(lSource.GetValue(i), lGenericArguments[0]), i);
+      if lTargetType.IsInstanceOfType(lResult) then
+        exit lResult;
+    end;
   end;
   if lTargetType.IsEnum then
     exit Enum.ToObject(lTargetType, aValue);

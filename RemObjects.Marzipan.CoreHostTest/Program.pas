@@ -111,6 +111,21 @@ begin
     if lSpaces ≠ '    ' then
       raise new MZException withName('CoreHostTest') reason('Unexpected BaseParser.GetSpaces result.') userInfo(nil);
 
+    writeLn('Testing Object[] to generic sequence conversion...');
+    var lValues := NSMutableArray.array();
+    lValues.addObject('one');
+    lValues.addObject('two');
+    var lManagedValues := new MZArray withNSArray(lValues);
+    var lTestType := new MZType withTypeName('RemObjects.Marzipan.Bridge.TestHelpers') &assembly('RemObjects.Marzipan.Bridge');
+    var lCountMethod := lTestType.getMethod(':CountStrings(System.Collections.Generic.IEnumerable`1<string>)');
+    var lCountFrame := new MZCallFrame withMethod(lCountMethod) target(nil) argumentCount(1);
+    lCountFrame.setObject(0) value(lManagedValues.__instance);
+    var lCountException := lCountFrame.invoke();
+    if assigned(lCountException) then
+      MZObject.raiseException(lCountException);
+    if lCountFrame.getInt32Result() ≠ 2 then
+      raise new MZException withName('CoreHostTest') reason('Object[] was not converted to IEnumerable<string>.') userInfo(nil);
+
     InvokeBridgeSmokeException('ThrowArgumentException') expectedType('System.ArgumentException');
     InvokeBridgeSmokeException('ThrowNullReferenceException') expectedType('System.NullReferenceException');
 
